@@ -66,7 +66,25 @@ class FedAvgAPI(object):
                 w_locals.append((client.get_sample_number(), copy.deepcopy(w)))
 
             # update global weights
-            w_global = self._aggregate(w_locals)
+
+            # w_global = self._aggregate(w_locals)
+            if self.args.fusion_mode == 'traditional':
+                w_global = self._aggregate(w_locals)
+            elif self.args.fusion_mode == 'ot':
+                w_global = self._aggregate_ot(w_locals)
+            elif self.args.fusion_mode == 'fusion':
+                w_global = self._aggregate_gm(w_locals, solver='Gurobi')
+            elif self.args.fusion_mode == 'fusion_gamf':
+                w_global = self._aggregate_gm(w_locals, solver='gamf')
+            elif self.args.fusion_mode == 'fusion_gamf_multi':
+                w_global = self._aggregate_gm(w_locals, solver='gamf_multi')
+            elif self.args.fusion_mode == 'fusion_ot':
+                w_global = self._aggregate_gm(w_locals, solver='ot')
+            elif self.args.fusion_mode == 'fusion_ot_multi':
+                w_global = self._aggregate_gm(w_locals, solver='ot_multi')
+            else:
+                raise NotImplementedError
+
             self.model_trainer.set_model_params(w_global)
 
             # test results
@@ -112,6 +130,78 @@ class FedAvgAPI(object):
                     averaged_params[k] = local_model_params[k] * w
                 else:
                     averaged_params[k] += local_model_params[k] * w
+        return averaged_params
+
+    def _aggregate_gm(self, w_locals, solver):
+        '''
+        aggregate all the parameters based on gm-fusion
+        all teh parameters are aligned to the first client
+        '''
+        import sys, os
+        sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "./../../../../")))
+        from fusion_gm_solver import gm_weight_align
+
+        training_num = 0
+        w_rate = []
+        for idx in range(len(w_locals)):
+            (sample_num, averaged_params) = w_locals[idx]
+            training_num += sample_num
+        for i in range(0, len(w_locals)):
+            w = 1 / len(w_locals)
+            w_rate.append(w)
+        if "multi" not in solver:
+            (sample_num, averaged_params) = w_locals[0]
+            anchor = averaged_params
+            for client_idx in range(0, len(w_locals)):
+                local_sample_number, local_model_params = w_locals[client_idx]
+                w = 1 / len(w_locals)
+                if client_idx == 0:
+                    averaged_params = {k: v * w for k, v in local_model_params.items()}
+                else:
+                    aligned_local_model_params = gm_weight_align(self.args, local_model_params, anchor, self.device,
+                                                                 solver)
+                    averaged_params = {k: averaged_params[k] + v * w for k, v in aligned_local_model_params.items()}
+        else:
+            local_model_params_list = []
+            for client_idx in range(0, len(w_locals)):
+                local_sample_number, local_model_params = w_locals[client_idx]
+                local_model_params_list.append(local_model_params)
+            aligned_local_model_params = gm_weight_align(self.args, local_model_params_list, None, self.device, w_rate, solver)
+            averaged_params = {k: v for k, v in aligned_local_model_params.items()}
+        return averaged_params
+
+    def _aggregate_ot(self, w_locals):
+        '''
+        aggregate all the parameters based on ot-fusion
+        all the parameters are aligned to the first client
+        '''
+        import sys, os
+        sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd(), "./../../../../")))
+        from wasserstein_ensemble_gm import ot_weight_align
+
+        training_num = 0
+        for idx in range(len(w_locals)):
+            (sample_num, averaged_params) = w_locals[idx]
+            training_num += sample_num
+
+        (sample_num, averaged_params) = w_locals[0]
+        T_var_pre_list = [None for i in range(0, len(w_locals))]
+        for k in averaged_params.keys():
+            anchor_local_params = w_locals[0][1][k]
+            for i in range(0, len(w_locals)):
+                local_sample_number, local_model_params = w_locals[i]
+                w = local_sample_number / training_num
+                if i == 0:
+                    averaged_params[k] = local_model_params[k] * w
+
+                else:
+                    aligned_local_model_params, T_var_pre_list[i] = \
+                        ot_weight_align(
+                            local_model_params[k],
+                            anchor_local_params,
+                            T_var_pre_list[i],
+                            self.device)
+                    averaged_params[k] += aligned_local_model_params * w
         return averaged_params
 
     def _local_test_on_all_clients(self, round_idx):
